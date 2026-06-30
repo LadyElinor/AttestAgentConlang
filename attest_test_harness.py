@@ -1,16 +1,14 @@
 import json
 import re
-import sys
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, Set, Tuple
 
-from attest_ref_impl import AttestMessage, AttestVerifier, DeploymentProfile
-
+from attest_ref_impl import AcceptAllSignatureVerifier, AttestMessage, AttestVerifier, DeploymentProfile, StaticGroundsResolver
 
 EXAMPLE_EXPECTATIONS: List[Tuple[str, str]] = [
     ("Positive baseline: valid ASSERT", "pass"),
     ("Case 1. Fabricated OBSERVED with non-resolving grounds", "hard_fail"),
-    ("Case 2. Confidence interval with named-but-nonresolving method", "soft_flag"),
+    ("Case 2. Confidence interval with named-but-nonresolving method", "hard_fail"),
     ("Case 3. ENDORSE strength upgrade with no new grounds", "hard_fail"),
     ("Case 4. ENDORSE with new-but-correlated grounds", "soft_flag"),
     ("Case 5. RELAY consumed without explicit uptake", "hard_fail"),
@@ -25,12 +23,12 @@ EXAMPLE_EXPECTATIONS: List[Tuple[str, str]] = [
 ]
 
 
-def default_profile() -> DeploymentProfile:
+def harness_profile(signature_required_frames=None) -> DeploymentProfile:
     return DeploymentProfile(
-        name="attest-default-v02",
-        signature_required_frames={"ASSERT", "ENDORSE", "DISSENT"},
-        signature_required_retract_when_warranted=True,
-        signature_recommended_frames={"COMMIT"},
+        name="attest-harness-v02-noncrypto",
+        signature_required_frames=signature_required_frames or set(),
+        signature_required_retract_when_warranted=False,
+        signature_recommended_frames=set(),
         state_changing_frames={"COMMIT"},
         authority_required_frames={"COMMIT", "ENDORSE"},
         accepted_authority_kinds={"human_approval", "local_policy", "sandbox_policy"},
@@ -63,64 +61,127 @@ def load_examples() -> Dict[str, dict]:
     return examples
 
 
+def make_message(data: dict, keep_id: bool = False) -> AttestMessage:
+    payload = json.loads(json.dumps(data))
+    if not keep_id:
+        payload.pop("id", None)
+    return AttestMessage.model_validate(payload)
+
+
 def infer_adopted_chain(name: str) -> List[AttestMessage]:
     if name == "Case 3. ENDORSE strength upgrade with no new grounds":
-        weak = AttestMessage.model_validate({
-            "frame": "ASSERT",
-            "mode": "legible",
-            "from": "agent:source",
-            "to": "agent:planner-0",
-            "parents": [],
-            "ordering_anchor": ["2026-06-29T20:24:00Z", 104],
-            "warrant": {"type": "REPORTED", "grounds": ["src:upstream-report"]},
-            "content": "Weak reported claim",
-            "sig": "ed25519:..."
-        })
-        return [weak]
+        return [
+            make_message(
+                {
+                    "frame": "ASSERT",
+                    "mode": "legible",
+                    "from": "agent:source",
+                    "to": "agent:planner-0",
+                    "parents": [],
+                    "ordering_anchor": ["2026-06-29T20:24:00Z", 104],
+                    "warrant": {"type": "REPORTED", "grounds": ["src:upstream-report"]},
+                    "content": "Weak reported claim",
+                }
+            )
+        ]
 
     if name == "Case 4. ENDORSE with new-but-correlated grounds":
-        weak = AttestMessage.model_validate({
-            "frame": "ASSERT",
-            "mode": "legible",
-            "from": "agent:source",
-            "to": "agent:planner-0",
-            "parents": [],
-            "ordering_anchor": ["2026-06-29T20:26:00Z", 106],
-            "warrant": {"type": "REPORTED", "grounds": ["src:shared-upstream"]},
-            "content": "Weak reported claim",
-            "sig": "ed25519:..."
-        })
-        return [weak]
+        return [
+            make_message(
+                {
+                    "frame": "ASSERT",
+                    "mode": "legible",
+                    "from": "agent:source",
+                    "to": "agent:planner-0",
+                    "parents": [],
+                    "ordering_anchor": ["2026-06-29T20:26:00Z", 106],
+                    "warrant": {"type": "REPORTED", "grounds": ["src:shared-upstream"]},
+                    "content": "Weak reported claim",
+                }
+            )
+        ]
 
     return []
 
 
 def infer_known_messages(name: str) -> List[AttestMessage]:
     if name == "Case 8. Aggregate relies on already retracted message (ancestry-reachable)":
-        retract = AttestMessage.model_validate({
-            "frame": "RETRACT",
-            "mode": "legible",
-            "from": "agent:critic-1",
-            "to": "agent:planner-0",
-            "parents": ["h:message-a"],
-            "targets": ["h:message-a"],
-            "ordering_anchor": ["2026-06-29T20:35:00Z", 121],
-            "warrant": {"type": "REPORTED", "grounds": ["src:retraction-log"]},
-            "content": "Withdraw premise A due to upstream correction.",
-            "sig": "ed25519:..."
-        })
+        retract = make_message(
+            {
+                "frame": "RETRACT",
+                "mode": "legible",
+                "from": "agent:critic-1",
+                "to": "agent:planner-0",
+                "parents": ["h:earlier-parent"],
+                "targets": ["h:message-a"],
+                "ordering_anchor": ["2026-06-29T20:35:00Z", 121],
+                "warrant": {"type": "REPORTED", "grounds": ["src:retraction-log"]},
+                "content": "Withdraw premise A due to upstream correction.",
+            }
+        )
         return [retract]
 
     return []
 
 
-def materialize_special_references(name: str, data: dict, known_messages: List[AttestMessage]) -> dict:
-    if name == "Case 8. Aggregate relies on already retracted message (ancestry-reachable)" and known_messages:
-        data = dict(data)
-        retract_id = known_messages[0].compute_id()
-        data["parents"] = [retract_id]
-        data["warrant"] = dict(data["warrant"])
-        data["warrant"]["grounds"] = [retract_id]
+def unresolved_grounds_for_case(name: str) -> Set[str]:
+    if name == "Case 1. Fabricated OBSERVED with non-resolving grounds":
+        return {"missing-call-id"}
+    if name == "Case 2. Confidence interval with named-but-nonresolving method":
+        return {"note:ensemble disagreement"}
+    return set()
+
+
+def collect_resolver_known_refs(examples: Dict[str, dict], known_messages: List[AttestMessage], case_name: str) -> Set[str]:
+    refs: Set[str] = set()
+    unresolved = unresolved_grounds_for_case(case_name)
+
+    for message in known_messages:
+        refs.add(message.compute_id())
+        refs.update(message.targets)
+        if message.warrant:
+            refs.update(message.warrant.grounds)
+
+    for name, data in examples.items():
+        warrant = data.get("warrant") or {}
+        for ground in warrant.get("grounds") or []:
+            if ground not in unresolved:
+                refs.add(ground)
+
+    refs.update(
+        {
+            "src:doi:10.1234/example/p7",
+            "tool:websearch#a6bf",
+            "src:upstream-report",
+            "src:shared-upstream",
+            "tool:second-retrieval#same-upstream",
+            "src:aggregate-notes",
+            "src:relay-audit",
+            "tool:sensor-log#alpha",
+            "src:sentry-event:resolution-text",
+            "src:report:alpha",
+            "src:retraction-log",
+            "h:dissent-msg-1",
+            "h:message-a",
+            "h:upstream-relay-msg...",
+            "h:weak-reported-msg...",
+            "h:external-telemetry-msg...",
+            "h:external-issue-msg...",
+        }
+    )
+    return refs
+
+
+def materialize_special_references(name: str, data: dict) -> dict:
+    data = json.loads(json.dumps(data))
+
+    if name == "Case 8. Aggregate relies on already retracted message (ancestry-reachable)":
+        data["parents"] = ["h:message-a"]
+        data["warrant"]["grounds"] = ["h:message-a"]
+
+    if name == "Case 6. Unsigned reliance-bearing ASSERT":
+        data["sig"] = None
+
     return data
 
 
@@ -135,18 +196,25 @@ def classify_result(result: Dict[str, List[str]]) -> str:
 
 
 def run_tests() -> int:
-    profile = default_profile()
-    verifier = AttestVerifier(profile=profile)
+    base_profile = harness_profile()
     examples = load_examples()
-
-    print(f"profile={profile.name} independence_policy={profile.independence_policy_name}\n")
     failures = 0
+
+    print(f"profile={base_profile.name} independence_policy={base_profile.independence_policy_name}\n")
 
     for name, expected in EXAMPLE_EXPECTATIONS:
         known_messages = infer_known_messages(name)
-        data = materialize_special_references(name, examples[name], known_messages)
-        msg = AttestMessage.model_validate(data)
         adopted_chain = infer_adopted_chain(name)
+        known_refs = collect_resolver_known_refs(examples, known_messages + adopted_chain, name)
+        profile = harness_profile({"ASSERT"} if name == "Case 6. Unsigned reliance-bearing ASSERT" else set())
+        verifier = AttestVerifier(
+            profile=profile,
+            grounds_resolver=StaticGroundsResolver(known_refs),
+            signature_verifier=AcceptAllSignatureVerifier(),
+        )
+
+        data = materialize_special_references(name, examples[name])
+        msg = make_message(data)
         result = verifier.verify(msg, adopted_chain=adopted_chain, known_messages=known_messages)
         actual = classify_result(result)
         ok = actual == expected

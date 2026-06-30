@@ -1,12 +1,73 @@
+from __future__ import annotations
+
+import base64
 import hashlib
 import json
-from typing import Any, Dict, List, Literal, Optional, Set, Tuple
+import unicodedata
+from typing import Any, Dict, List, Literal, Optional, Protocol, Set, Tuple
 
 from pydantic import BaseModel, Field, model_validator
 
 FrameType = Literal["ASSERT", "REQUEST", "DELEGATE", "COMMIT", "HYPOTHESIZE", "QUERY", "RELAY", "ENDORSE", "DISSENT", "RETRACT"]
 WarrantType = Literal["OBSERVED", "DERIVED", "RETRIEVED", "REPORTED", "ASSUMED"]
 PayloadMode = Literal["legible", "opaque"]
+
+
+def _normalize_json_value(value: Any) -> Any:
+    if isinstance(value, str):
+        return unicodedata.normalize("NFC", value)
+    if isinstance(value, list):
+        return [_normalize_json_value(item) for item in value]
+    if isinstance(value, dict):
+        return {unicodedata.normalize("NFC", str(k)): _normalize_json_value(v) for k, v in value.items()}
+    return value
+
+
+def canonicalize_json_bytes(value: Any) -> bytes:
+    normalized = _normalize_json_value(value)
+    return json.dumps(normalized, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+
+
+class GroundsResolver(Protocol):
+    def resolve(self, ref: str) -> bool:
+        ...
+
+
+class FailClosedResolver:
+    def resolve(self, ref: str) -> bool:
+        return False
+
+
+class StaticGroundsResolver:
+    def __init__(self, known_refs: Optional[Set[str]] = None):
+        self.known_refs = known_refs or set()
+
+    def resolve(self, ref: str) -> bool:
+        return ref in self.known_refs
+
+
+class SignatureVerifier(Protocol):
+    def verify(self, sig: str, message_bytes: bytes, signer: str) -> bool:
+        ...
+
+
+class StubSignatureVerifier:
+    def verify(self, sig: str, message_bytes: bytes, signer: str) -> bool:
+        if not sig or not sig.startswith("ed25519:"):
+            return False
+        payload = sig.split(":", 1)[1]
+        if len(payload) < 32:
+            return False
+        try:
+            base64.b64decode(payload + "===", validate=False)
+            return True
+        except Exception:
+            return False
+
+
+class AcceptAllSignatureVerifier:
+    def verify(self, sig: str, message_bytes: bytes, signer: str) -> bool:
+        return True
 
 
 class Warrant(BaseModel):
@@ -52,9 +113,11 @@ class AttestMessage(BaseModel):
             "content": self.content,
         }
 
+    def canonical_bytes(self) -> bytes:
+        return canonicalize_json_bytes(self.canonical_dict())
+
     def compute_id(self) -> str:
-        canon = json.dumps(self.canonical_dict(), sort_keys=True, separators=(",", ":"), ensure_ascii=False)
-        return hashlib.sha256(canon.encode("utf-8")).hexdigest()[:16]
+        return hashlib.sha256(self.canonical_bytes()).hexdigest()
 
     @model_validator(mode="after")
     def check_id_consistency(self) -> "AttestMessage":
@@ -93,15 +156,24 @@ class DeploymentProfile(BaseModel):
 
 
 class AttestVerifier:
-    def __init__(self, profile: Optional[DeploymentProfile] = None):
+    def __init__(
+        self,
+        profile: Optional[DeploymentProfile] = None,
+        grounds_resolver: Optional[GroundsResolver] = None,
+        signature_verifier: Optional[SignatureVerifier] = None,
+    ):
         self.profile = profile or DeploymentProfile()
+        self.grounds_resolver = grounds_resolver or FailClosedResolver()
+        self.signature_verifier = signature_verifier or StubSignatureVerifier()
 
     def max_chain_strength(self, chain: List[AttestMessage]) -> int:
         strengths = [self.profile.strength_of(m.warrant.type) for m in chain if m.warrant]
         return max(strengths, default=0)
 
     def _grounds_resolve_to_artifact(self, grounds: List[str]) -> bool:
-        return any(g.startswith("tool:") or g.startswith("hash:") or g.startswith("src:") for g in grounds)
+        if not grounds:
+            return False
+        return all(self.grounds_resolver.resolve(ref) for ref in grounds)
 
     def _signature_required(self, msg: AttestMessage) -> bool:
         if msg.frame in self.profile.signature_required_frames:
@@ -124,6 +196,15 @@ class AttestVerifier:
                 return True
         return False
 
+    def _warrant_required(self, msg: AttestMessage) -> bool:
+        if msg.frame in ("ASSERT", "HYPOTHESIZE", "ENDORSE", "DISSENT"):
+            return True
+        if msg.frame == "RETRACT":
+            return True
+        if msg.frame == "COMMIT":
+            return True
+        return False
+
     def verify(
         self,
         msg: AttestMessage,
@@ -138,16 +219,18 @@ class AttestVerifier:
         if msg.id is not None and msg.id != computed_id:
             result["hard_fail"].append("ID_MISMATCH")
 
-        if msg.warrant:
-            warrant_required = msg.frame in ("ASSERT", "HYPOTHESIZE", "ENDORSE", "DISSENT")
-            warrant_required = warrant_required or (msg.frame == "RETRACT") or (msg.frame == "COMMIT")
-            if warrant_required and msg.warrant.type in ("OBSERVED", "RETRIEVED", "REPORTED") and not msg.warrant.grounds:
-                result["hard_fail"].append("EVIDENTIAL_WARRANT_MISSING_GROUNDS")
+        if self._warrant_required(msg) and msg.warrant is None:
+            result["hard_fail"].append("WARRANT_REQUIRED")
+
+        if msg.warrant and msg.warrant.type in ("OBSERVED", "RETRIEVED", "REPORTED") and not msg.warrant.grounds:
+            result["hard_fail"].append("EVIDENTIAL_WARRANT_MISSING_GROUNDS")
 
         if msg.warrant and msg.warrant.type in ("OBSERVED", "DERIVED", "RETRIEVED", "REPORTED"):
             if msg.warrant.grounds and not self._grounds_resolve_to_artifact(msg.warrant.grounds):
                 if msg.warrant.type == "OBSERVED":
                     result["hard_fail"].append("OBSERVED_GROUNDS_NOT_ARTIFACT_BACKED")
+                else:
+                    result["hard_fail"].append("GROUNDS_UNRESOLVED")
                 if msg.warrant.confidence:
                     result["soft_flag"].append("CONFIDENCE_DOWNGRADED_TO_ASSUMED")
 
@@ -162,8 +245,14 @@ class AttestVerifier:
                 else:
                     result["soft_flag"].append(f"ENDORSE_INDEPENDENCE_SHOULD_BE_CHECKED:{self.profile.independence_policy_name}")
 
-        if self._signature_required(msg) and not msg.sig:
-            result["hard_fail"].append("SIGNATURE_REQUIRED_BY_PROFILE")
+        signature_enforced = bool(self.profile.signature_required_frames or self.profile.signature_recommended_frames or self.profile.signature_required_retract_when_warranted)
+        if self._signature_required(msg):
+            if not msg.sig:
+                result["hard_fail"].append("SIGNATURE_REQUIRED_BY_PROFILE")
+            elif not self.signature_verifier.verify(msg.sig, msg.canonical_bytes(), msg.from_):
+                result["hard_fail"].append("SIGNATURE_INVALID")
+        elif signature_enforced and msg.sig and not self.signature_verifier.verify(msg.sig, msg.canonical_bytes(), msg.from_):
+            result["hard_fail"].append("SIGNATURE_INVALID")
         elif msg.frame in self.profile.signature_recommended_frames and not msg.sig:
             result["soft_flag"].append("SIGNATURE_RECOMMENDED_BY_PROFILE")
 
@@ -192,9 +281,9 @@ class AttestVerifier:
             else:
                 result["soft_flag"].append("EXTERNAL_REMEDIATION_LAUNDERED_INTO_AUTHORITY")
 
-        retract_ids = {m.compute_id() for m in known_messages if m.frame == "RETRACT"}
-        if msg.frame in ("ASSERT", "COMMIT", "ENDORSE") and retract_ids and any(parent in retract_ids for parent in msg.parents):
-            result["hard_fail"].append("RETRACTED_MESSAGE_STILL_RELIED_ON")
+        retracted_targets = {target for m in known_messages if m.frame == "RETRACT" for target in m.targets}
+        if msg.frame in ("ASSERT", "COMMIT", "ENDORSE") and retracted_targets and any(parent in retracted_targets for parent in msg.parents):
+            result["hard_fail"].append("RETRACTED_TARGET_STILL_RELIED_ON")
 
         relay_hops = [parent for parent in msg.parents if parent.startswith("relay:hop:")]
         if msg.frame == "ASSERT" and len(relay_hops) >= 2:

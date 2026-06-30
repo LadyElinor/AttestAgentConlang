@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "attest-agent-conlang"
+version = "0.1.0"
+description = "Attest protocol draft, reference verifier skeleton, and adversarial harness"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+authors = [
+  { name = "LadyElinor" }
+]
+dependencies = [
+  "pydantic>=2.13,<3",
+  "PyNaCl>=1.5,<2",
+  "hypothesis>=6.130,<7"
+]
+
+[tool.setuptools]
+py-modules = ["attest_ref_impl", "attest_test_harness"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
