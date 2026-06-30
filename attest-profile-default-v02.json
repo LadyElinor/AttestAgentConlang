@@ -1,0 +1,39 @@
+{
+  "profile_id": "attest-default-v02",
+  "profile_version": "0.2.0-draft",
+  "warrant_strength_order": {
+    "OBSERVED": 5,
+    "DERIVED": 4,
+    "RETRIEVED": 3,
+    "REPORTED": 2,
+    "ASSUMED": 1
+  },
+  "signature_required_frames": ["ASSERT", "ENDORSE", "DISSENT"],
+  "signature_required_retract_when_warranted": true,
+  "signature_recommended_frames": ["COMMIT"],
+  "state_changing_frames": ["COMMIT"],
+  "authority_required_frames": ["COMMIT", "ENDORSE"],
+  "accepted_authority_kinds": ["human_approval", "local_policy", "sandbox_policy"],
+  "require_local_authority_chain_for_state_change": true,
+  "grounds_namespaces": {
+    "msg": "message identifiers",
+    "tool": "tool or execution receipts",
+    "src": "external source citations",
+    "doc": "document anchors",
+    "receipt": "authority or execution receipts",
+    "policy": "local policy artifacts",
+    "h": "legacy content-addressed message identifiers"
+  },
+  "grounds_resolution_policy": {
+    "unresolved_observed": "hard_fail",
+    "unresolved_derived": "hard_fail",
+    "unresolved_retrieved": "hard_fail",
+    "unresolved_reported": "hard_fail",
+    "confidence_without_method_artifact": "soft_flag"
+  },
+  "local_authority_prefixes": ["approval:", "policy:", "sandbox:", "receipt:"],
+  "external_authority_prefixes": ["src:sentry-event", "src:external-issue", "src:ticket", "src:web", "src:github-issue"],
+  "relay_parent_prefixes": ["h:upstream-relay", "relay:hop:"],
+  "ordering_anchor_semantics": "timestamp-sequence-total-order",
+  "independence_policy_name": "declared-lineage-default"
+}

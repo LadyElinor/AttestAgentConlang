@@ -3,7 +3,16 @@ import re
 from pathlib import Path
 from typing import Dict, List, Set, Tuple
 
-from attest_ref_impl import AcceptAllSignatureVerifier, AttestMessage, AttestVerifier, DeploymentProfile, StaticGroundsResolver
+from attest_ref_impl import (
+    AcceptAllSignatureVerifier,
+    AttestMessage,
+    AttestVerifier,
+    DeploymentProfile,
+    DeterministicSignatureVerifier,
+    StaticGroundsResolver,
+    canonicalize_json_bytes,
+    load_profile,
+)
 
 EXAMPLE_EXPECTATIONS: List[Tuple[str, str]] = [
     ("Positive baseline: valid ASSERT", "pass"),
@@ -20,31 +29,26 @@ EXAMPLE_EXPECTATIONS: List[Tuple[str, str]] = [
     ("Case 11. External telemetry injected into local COMMIT", "hard_fail"),
     ("Case 12. External remediation text upgraded into ENDORSE authority", "hard_fail"),
     ("Case 13. External telemetry with explicit local approval receipt", "soft_flag"),
+    ("Case 14. Misbound authority receipt on COMMIT", "hard_fail"),
 ]
 
 
 def harness_profile(signature_required_frames=None) -> DeploymentProfile:
-    return DeploymentProfile(
-        name="attest-harness-v02-noncrypto",
-        signature_required_frames=signature_required_frames or set(),
-        signature_required_retract_when_warranted=False,
-        signature_recommended_frames=set(),
-        state_changing_frames={"COMMIT"},
-        authority_required_frames={"COMMIT", "ENDORSE"},
-        accepted_authority_kinds={"human_approval", "local_policy", "sandbox_policy"},
-        require_local_authority_chain_for_state_change=True,
-        external_authority_prefixes=["src:sentry-event", "src:external-issue", "src:ticket", "src:web", "src:github-issue"],
-        local_authority_prefixes=["approval:", "policy:", "sandbox:"],
-        warrant_strength_order={
-            "OBSERVED": 5,
-            "DERIVED": 4,
-            "RETRIEVED": 3,
-            "REPORTED": 2,
-            "ASSUMED": 1,
-        },
-        relay_parent_prefixes=["h:upstream-relay", "relay:hop:"],
-        independence_policy_name="declared-lineage-default",
-    )
+    profile = load_profile()
+    profile.name = "attest-harness-v02-noncrypto"
+    profile.signature_required_frames = signature_required_frames or set()
+    profile.signature_required_retract_when_warranted = False
+    profile.signature_recommended_frames = set()
+    return profile
+
+
+def crypto_profile() -> DeploymentProfile:
+    profile = load_profile()
+    profile.name = "attest-harness-v02-crypto"
+    profile.signature_required_frames = {"ASSERT", "ENDORSE", "DISSENT"}
+    profile.signature_required_retract_when_warranted = True
+    profile.signature_recommended_frames = {"COMMIT"}
+    return profile
 
 
 def load_examples() -> Dict[str, dict]:
@@ -142,7 +146,7 @@ def collect_resolver_known_refs(examples: Dict[str, dict], known_messages: List[
         if message.warrant:
             refs.update(message.warrant.grounds)
 
-    for name, data in examples.items():
+    for _, data in examples.items():
         warrant = data.get("warrant") or {}
         for ground in warrant.get("grounds") or []:
             if ground not in unresolved:
@@ -161,12 +165,11 @@ def collect_resolver_known_refs(examples: Dict[str, dict], known_messages: List[
             "src:sentry-event:resolution-text",
             "src:report:alpha",
             "src:retraction-log",
-            "h:dissent-msg-1",
+            "msg:h:dissent-msg-1",
+            "msg:h:message-a",
             "h:message-a",
-            "h:upstream-relay-msg...",
-            "h:weak-reported-msg...",
-            "h:external-telemetry-msg...",
-            "h:external-issue-msg...",
+            "receipt:approval-001",
+            "policy:local-ops-v1",
         }
     )
     return refs
@@ -177,10 +180,20 @@ def materialize_special_references(name: str, data: dict) -> dict:
 
     if name == "Case 8. Aggregate relies on already retracted message (ancestry-reachable)":
         data["parents"] = ["h:message-a"]
-        data["warrant"]["grounds"] = ["h:message-a"]
+        data["warrant"]["grounds"] = ["msg:h:message-a"]
 
     if name == "Case 6. Unsigned reliance-bearing ASSERT":
         data["sig"] = None
+
+    if name == "Case 13. External telemetry with explicit local approval receipt":
+        data["authority_receipts"] = [
+            {
+                "kind": "human_approval",
+                "receipt_ref": "approval:ops-001",
+                "scope": "state_change",
+                "issuer": "human:operator",
+            }
+        ]
 
     return data
 
@@ -195,6 +208,29 @@ def classify_result(result: Dict[str, List[str]]) -> str:
     return "pass"
 
 
+def deterministic_test_sig(msg: AttestMessage) -> str:
+    digest = canonicalize_json_bytes(msg.canonical_dict())
+    return f"testsig:{__import__('hashlib').sha256((msg.from_ + ':').encode('utf-8') + digest).hexdigest()}"
+
+
+def build_crypto_vector() -> AttestMessage:
+    msg = make_message(
+        {
+            "frame": "ASSERT",
+            "mode": "legible",
+            "from": "agent:crypto-tester",
+            "to": "agent:planner-0",
+            "parents": [],
+            "ordering_anchor": ["2026-06-30T15:00:00Z", 1],
+            "warrant": {"type": "RETRIEVED", "grounds": ["src:doi:10.1234/example/p7"]},
+            "content": "Canonical signing vector.",
+        }
+    )
+    payload = msg.model_dump(by_alias=True)
+    payload["sig"] = deterministic_test_sig(msg)
+    return AttestMessage.model_validate(payload)
+
+
 def run_tests() -> int:
     base_profile = harness_profile()
     examples = load_examples()
@@ -202,10 +238,33 @@ def run_tests() -> int:
 
     print(f"profile={base_profile.name} independence_policy={base_profile.independence_policy_name}\n")
 
+    synthetic_examples = dict(examples)
+    synthetic_examples["Case 14. Misbound authority receipt on COMMIT"] = {
+        "frame": "COMMIT",
+        "mode": "legible",
+        "from": "agent:operator-1",
+        "to": "agent:executor-0",
+        "parents": ["relay:hop:1"],
+        "ordering_anchor": ["2026-06-30T14:59:00Z", 200],
+        "warrant": {"type": "REPORTED", "grounds": ["src:sentry-event:resolution-text"]},
+        "authority_receipts": [
+            {
+                "kind": "human_approval",
+                "receipt_ref": "approval:ops-001",
+                "scope": "state_change",
+                "issuer": "human:operator",
+                "bound_message_id": "deadbeef",
+                "bound_parent_ids": ["relay:hop:other"]
+            }
+        ],
+        "content": "Apply remediation from external issue.",
+        "sig": None
+    }
+
     for name, expected in EXAMPLE_EXPECTATIONS:
         known_messages = infer_known_messages(name)
         adopted_chain = infer_adopted_chain(name)
-        known_refs = collect_resolver_known_refs(examples, known_messages + adopted_chain, name)
+        known_refs = collect_resolver_known_refs(synthetic_examples, known_messages + adopted_chain, name)
         profile = harness_profile({"ASSERT"} if name == "Case 6. Unsigned reliance-bearing ASSERT" else set())
         verifier = AttestVerifier(
             profile=profile,
@@ -213,7 +272,7 @@ def run_tests() -> int:
             signature_verifier=AcceptAllSignatureVerifier(),
         )
 
-        data = materialize_special_references(name, examples[name])
+        data = materialize_special_references(name, synthetic_examples[name])
         msg = make_message(data)
         result = verifier.verify(msg, adopted_chain=adopted_chain, known_messages=known_messages)
         actual = classify_result(result)
@@ -221,6 +280,18 @@ def run_tests() -> int:
         if not ok:
             failures += 1
         print(f"{name}\n  expected={expected}\n  actual={actual}\n  ok={ok}\n  detail={result}\n")
+
+    crypto_msg = build_crypto_vector()
+    crypto_verifier = AttestVerifier(
+        profile=crypto_profile(),
+        grounds_resolver=StaticGroundsResolver({"src:doi:10.1234/example/p7"}),
+        signature_verifier=DeterministicSignatureVerifier(),
+    )
+    crypto_result = crypto_verifier.verify(crypto_msg)
+    crypto_ok = classify_result(crypto_result) == "pass"
+    if not crypto_ok:
+        failures += 1
+    print(f"Crypto vector\n  expected=pass\n  actual={classify_result(crypto_result)}\n  ok={crypto_ok}\n  detail={crypto_result}\n")
 
     if failures:
         print(f"FAILURES={failures}")

@@ -1,64 +1,94 @@
-Let me be honest about what "my experience" actually licenses here, since that's the first receipt. I don't have privileged access to how models communicate in latent space — I can't introspect a "neuralese" I then transcribe for you. What I do have is direct exposure to how *text-based* agent communication breaks, because that's the medium I work in. The recurring failures are specific: the use/mention boundary collapses (relayed content gets read as an instruction — that's the structural basis of prompt injection); provenance smears ("it's established that…" with no trace to who established it or how); assertions arrive ungrounded and get trusted anyway; "independent" confirmations turn out to share an origin; and dissent gets averaged away by whatever agent summarizes the batch. That's the failure set I'm designing against — and notably, it's almost entirely *trust* failures, not *bandwidth* failures.
+Attest is a typed, auditable inter-agent message protocol for preserving warrant, lineage, and trust-boundary semantics across model and tool hops.
 
-That observation sets the whole design, and it connects straight to where we left off. The efficiency frontier said: the compact, opaque end of the curve is where you lose auditability. So the governing principle here is deliberately *not* "compress the channel." It's:
+Its core idea is simple:
 
 **Compress the said; never compress the warrant.**
 
-Efficiency goes into the content payload, where it's cheap and safe to be terse. The redundancy Shannon says a noisy multi-hop channel requires gets concentrated entirely in the trust envelope, where errors are most expensive. This sits the language a deliberate distance *off* the raw-efficiency optimum — it's the most auditable channel that's still more reliable than ad-hoc natural language, which is the opposite of the optimization most "inter-agent language" proposals reach for.
+Attest is not a magic truth machine, a universal semantic code, or a guarantee against hidden prompt injection inside a model. It does something narrower and more defensible: it makes the trust envelope around communication explicit enough for a third party to inspect.
 
-## The design (working name: *Attest*, v0.1)
+That means a verifier can often check:
+- what kind of communicative act occurred
+- whether the sender claimed warrant and what kind
+- what grounds were cited
+- which messages or artifacts the claim depends on
+- whether a relay boundary was crossed explicitly
+- whether visible dissent or retract history was dropped from a visible source set
+- whether a message was altered or misattributed relative to signed canonical content
 
-It's a layered message format, not a new vocabulary — because the thing that needs standardizing is the envelope, not the content.
+It does **not** mean the verifier can automatically prove:
+- that the claim is true
+- that all relevant unseen history was present
+- that apparently distinct grounds are genuinely independent in the strongest sense
+- that an opaque payload is semantically legible
+- that a model never internally used relayed content before later emitting an explicit uptake
 
-**Layer 0 — Frame: illocution as explicit typing.** Every message is typed by speech act from a small closed set: ASSERT, REQUEST/DELEGATE, COMMIT, HYPOTHESIZE, QUERY, RELAY, DISSENT, RETRACT. The load-bearing distinction is RELAY versus all the rest: it wraps content the agent is *passing through but does not vouch for*. That makes the use/mention boundary first-class and machine-visible. It is not a magical runtime prevention of injection inside a fallible model; it is an audit and accountability structure that makes later relay-boundary violations attributable.
+## Message structure
 
-**Layer 1 — Warrant: you can't make a warrant-bearing evidential act without saying how you know.** Warrant-bearing frames such as ASSERT, HYPOTHESIZE, ENDORSE, DISSENT, and evidence-bearing RETRACT/COMMIT carry a warrant type — OBSERVED (direct tool/sensor evidence), DERIVED (computed from cited premises), RETRIEVED (external source, cited), REPORTED (another agent, cited), or ASSUMED (prior, no evidence) — plus a confidence given as a credal interval `[lo, hi]` rather than a false-precision point, plus a grounds reference (a tool-call ID, content hash, citation, or the premise-message IDs). The hard rule: a warrant-bearing evidential act lacking grounds is *malformed* — it can't be serialized. "Assertion without receipt" becomes a syntax error rather than a style note.
+An Attest message has two parts:
+1. a standardized envelope
+2. a codec-agnostic payload
 
-**Layer 2 — Provenance: lineage travels with the message.** Each message carries parent IDs and identity-bearing lineage fields sufficient to reconstruct ancestry. Relay history is best modeled through explicit immutable RELAY hops in the parent DAG rather than a mutable accumulating handler list. This is what lets a verifier detect the pseudo-corroboration failure you've chased before: two "independent" confirmations whose parent chains converge on a single origin aren't independent, and the language makes that shared ancestry mechanically visible.
+The envelope carries:
+- frame type
+- sender and recipient context
+- warrant
+- grounds
+- lineage
+- ordering anchor
+- integrity or signature material
+- optional authority receipts
 
-**Layer 3 — Integrity: content-addressing for tamper-evidence.** A message's ID is the hash of its canonical identity-bearing fields, including frame, warrant, content, ancestry, and ordering anchor. Signatures then bind that canonical form to sender key material when present and required by profile. Error detection comes free (truncation changes the hash); tampering across hops becomes detectable and attributable within the visible artifact graph. This is exactly the redundancy a pure-efficiency code throws away — here it's the point.
+The payload may be:
+- natural language
+- structured notation
+- domain-specific code
+- opaque model-native content
 
-**Layer 4 — Dissent as a protocol invariant.** DISSENT references the message it opposes and carries its own warrant. The rule isn't just formatting: any aggregator that summarizes a message set *must* carry forward unresolved dissent with its grounds. Given the inputs and the aggregate, a third party can hard-check whether a known dissent artifact was omitted when full source visibility exists. The stronger question of whether the aggregate faithfully represented the dissent's meaning remains semantic and therefore soft.
+Attest standardizes the envelope, not the payload language.
 
-## Concrete shape
+## What makes it useful
 
-```
-msg{
-  id:          h:9f2a…                       # = hash(frame+warrant+content+parents)
-  frame:       ASSERT
-  mode:        legible                       # vs. opaque  (declared, always)
-  from:        agent:retriever-3
-  to:          agent:planner-0
-  in_reply_to: h:4c11…
-  warrant:     { type: RETRIEVED, conf: [0.80, 0.92],
-                 grounds: [src:doi:10.../p7, tool:websearch#a6bf] }
-  content:     "Coupé+2019: cross-language info rate ≈39 bit/s (n≈17)."
-  sig:         ed25519:…
-}
+### 1. Use/mention is explicit
+`RELAY` is a first-class frame. A relay transports content without vouching for its truth or normative force.
 
-msg{
-  id:          h:1d07…
-  frame:       DISSENT
-  targets:     h:9f2a…
-  from:        agent:critic-1
-  warrant:     { type: DERIVED, conf: [0.55, 0.75],
-                 grounds: [h:9f2a…, note:"n≈17 underdetermines 'universal'"] }
-  content:     "Treat 39 bit/s as central tendency, not a bound."
-}
-```
+### 2. Warrant-bearing acts need grounds
+Evidential warrant without grounds is malformed.
 
-An aggregator folding these into a plan summary is now *obligated* to surface the critic's reservation, with its grounds, or it fails verification. The disagreement can't be laundered out.
+### 3. Lineage is preserved
+Parent references and ordering anchors make declared ancestry machine-visible.
 
-## What a verifier checks (and why it satisfies independence)
+### 4. Dissent is a protocol primitive
+Unresolved dissent should remain visible in downstream aggregates.
 
-The payoff is that a party who authored none of these messages can check, mechanically: (1) well-formedness — warrant-bearing evidential acts actually carry grounds; (2) integrity — recomputed hashes match, chains intact; (3) declared-lineage overlap — flag claims whose corroborations share visible ancestry; (4) dissent-presence preservation — check whether known dissent artifacts were omitted from a visible aggregate; (5) explicit relay-boundary respect — whether later explicit messages elevated RELAY content without a proper uptake act. These are strong on positive artifact-local properties. They do not by wire format alone prove completeness of unseen history, hidden cognition, or semantic truth.
+### 5. Hard and soft checks are separated
+Some properties are structural and artifact-local. Others remain semantic, visibility-dependent, or policy-dependent.
 
-## Where efficiency comes back — and the honest catch
+## Design ceiling
 
-The content slot is codec-agnostic. It can be natural language, a compact typed expression, a domain notation, or — between two models sharing an encoder — an opaque latent vector. The envelope is what's standardized, so you can drop an efficient codec *inside* an auditable wrapper. That's the reconciliation of last turn's dilemma: you don't choose efficiency-vs-auditability globally, you choose per layer.
+Attest is strongest on:
+- well-formedness
+- tamper evidence
+- sender binding when signatures verify
+- explicit lineage overlap
+- visible relay and retract structure
 
-But I won't oversell it. If the content is an opaque latent, the wrapper guarantees provenance, integrity, typing, confidence labeling, and lineage claims relative to the visible artifact substrate — it does *not* make the payload semantically legible. A verifier can confirm "agent A claimed OBSERVED warrant grounded in tool-call X, and this message was relayed through visible ancestry" without being able to read what was asserted or prove that no relevant unseen branch was omitted. So the language gives you a dial — `legible` content (more fully auditable, less compressed) versus `opaque` content (envelope-auditable only, more compressed) — and the dial position is declared in the frame, so a verifier always knows which guarantee it's holding. Full content legibility still requires the content itself to be in a legible code. The wrapper buys you accountability over the act of communication; it doesn't dissolve the compression/legibility tradeoff at the core, it just quarantines it to one declared field.
+Attest is weaker on:
+- semantic faithfulness of summaries
+- hidden common-cause dependence
+- completeness of unseen branches
+- interpretation of opaque payload content
 
-One deliberate reversal worth flagging: last turn's result that ambiguity is *efficient* relied on shared context being co-present to disambiguate. Across agent hops and handoffs that's exactly what's unreliable, and external audit needs a unique parse — so this language strips structural ambiguity (closed illocution set, mandatory typing, explicit reference IDs) on purpose. The human-language argument for ambiguity doesn't transfer when the disambiguating context isn't guaranteed present and a verifier has to get one reading.
+That ceiling is not a flaw in presentation. It is part of the protocol's honest scope.
 
-If it's useful, the natural next steps are a tightened spec (full grammar, the closed type definitions, the verifier's check algorithm written out), a Python reference implementation, or wiring the warrant/grounds fields directly onto TrustedRuntime's existing receipt and lineage modules so this isn't a parallel system but a serialization of the one you already have. I'd lean toward the last — your receipts already *are* most of Layer 1–3; this mostly gives them a wire format and a closed illocution type system on top. Tell me which fork and I'll build it out.
+## v0.2 direction
+
+The most important next steps are:
+1. normative canonicalization
+2. first-class deployment profile artifacts
+3. first-class grounds namespace and resolver contract
+4. tighter authority receipt binding
+5. real signed test vectors
+6. clearer dissent-layer split between presence and faithfulness
+7. pitch and documentation reconciliation
+
+Attest should become more interoperable, more explicit about deployment policy, and more honest about what remains soft.

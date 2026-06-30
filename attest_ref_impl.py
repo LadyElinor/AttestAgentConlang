@@ -4,6 +4,7 @@ import base64
 import hashlib
 import json
 import unicodedata
+from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional, Protocol, Set, Tuple
 
 from pydantic import BaseModel, Field, model_validator
@@ -11,6 +12,22 @@ from pydantic import BaseModel, Field, model_validator
 FrameType = Literal["ASSERT", "REQUEST", "DELEGATE", "COMMIT", "HYPOTHESIZE", "QUERY", "RELAY", "ENDORSE", "DISSENT", "RETRACT"]
 WarrantType = Literal["OBSERVED", "DERIVED", "RETRIEVED", "REPORTED", "ASSUMED"]
 PayloadMode = Literal["legible", "opaque"]
+GroundsStatus = Literal["resolved", "unresolved", "stale", "malformed", "inaccessible_under_profile"]
+
+
+CANONICAL_FIELD_ORDER = [
+    "frame",
+    "mode",
+    "from",
+    "to",
+    "in_reply_to",
+    "parents",
+    "targets",
+    "ordering_anchor",
+    "warrant",
+    "authority_receipts",
+    "content",
+]
 
 
 def _normalize_json_value(value: Any) -> Any:
@@ -25,25 +42,36 @@ def _normalize_json_value(value: Any) -> Any:
 
 def canonicalize_json_bytes(value: Any) -> bytes:
     normalized = _normalize_json_value(value)
-    return json.dumps(normalized, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    return json.dumps(normalized, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False).encode("utf-8")
+
+
+class GroundsResolution(BaseModel):
+    ref: str
+    status: GroundsStatus
+    detail: Optional[str] = None
 
 
 class GroundsResolver(Protocol):
-    def resolve(self, ref: str) -> bool:
+    def resolve(self, ref: str) -> GroundsResolution:
         ...
 
 
 class FailClosedResolver:
-    def resolve(self, ref: str) -> bool:
-        return False
+    def resolve(self, ref: str) -> GroundsResolution:
+        return GroundsResolution(ref=ref, status="unresolved", detail="no resolver configured")
 
 
 class StaticGroundsResolver:
-    def __init__(self, known_refs: Optional[Set[str]] = None):
+    def __init__(self, known_refs: Optional[Set[str]] = None, status_overrides: Optional[Dict[str, GroundsStatus]] = None):
         self.known_refs = known_refs or set()
+        self.status_overrides = status_overrides or {}
 
-    def resolve(self, ref: str) -> bool:
-        return ref in self.known_refs
+    def resolve(self, ref: str) -> GroundsResolution:
+        if ref in self.status_overrides:
+            return GroundsResolution(ref=ref, status=self.status_overrides[ref])
+        if ref in self.known_refs:
+            return GroundsResolution(ref=ref, status="resolved")
+        return GroundsResolution(ref=ref, status="unresolved")
 
 
 class SignatureVerifier(Protocol):
@@ -70,6 +98,12 @@ class AcceptAllSignatureVerifier:
         return True
 
 
+class DeterministicSignatureVerifier:
+    def verify(self, sig: str, message_bytes: bytes, signer: str) -> bool:
+        digest = hashlib.sha256((signer + ":").encode("utf-8") + message_bytes).hexdigest()
+        return sig == f"testsig:{digest}"
+
+
 class Warrant(BaseModel):
     type: WarrantType
     confidence: Optional[Tuple[float, float]] = None
@@ -81,6 +115,10 @@ class AuthorityReceipt(BaseModel):
     receipt_ref: str
     scope: Literal["state_change", "package_install", "shell_exec", "network_fetch", "general"] = "general"
     issuer: str
+    bound_message_id: Optional[str] = None
+    bound_parent_ids: List[str] = Field(default_factory=list)
+    expires_at: Optional[str] = None
+    nonce: Optional[str] = None
 
 
 class AttestMessage(BaseModel):
@@ -99,7 +137,7 @@ class AttestMessage(BaseModel):
     sig: Optional[str] = None
 
     def canonical_dict(self) -> Dict[str, Any]:
-        return {
+        canonical = {
             "frame": self.frame,
             "mode": self.mode,
             "from": self.from_,
@@ -112,6 +150,7 @@ class AttestMessage(BaseModel):
             "authority_receipts": [receipt.model_dump() for receipt in self.authority_receipts],
             "content": self.content,
         }
+        return {field: canonical[field] for field in CANONICAL_FIELD_ORDER}
 
     def canonical_bytes(self) -> bytes:
         return canonicalize_json_bytes(self.canonical_dict())
@@ -130,6 +169,8 @@ class AttestMessage(BaseModel):
 
 class DeploymentProfile(BaseModel):
     name: str = "default"
+    profile_id: Optional[str] = None
+    profile_version: Optional[str] = None
     signature_required_frames: Set[FrameType] = Field(default_factory=lambda: {"ASSERT", "ENDORSE", "DISSENT"})
     signature_required_retract_when_warranted: bool = True
     signature_recommended_frames: Set[FrameType] = Field(default_factory=lambda: {"COMMIT"})
@@ -138,7 +179,17 @@ class DeploymentProfile(BaseModel):
     accepted_authority_kinds: Set[str] = Field(default_factory=lambda: {"human_approval", "local_policy", "sandbox_policy"})
     require_local_authority_chain_for_state_change: bool = True
     external_authority_prefixes: List[str] = Field(default_factory=lambda: ["src:sentry-event", "src:external-issue", "src:ticket", "src:web", "src:github-issue"])
-    local_authority_prefixes: List[str] = Field(default_factory=lambda: ["approval:", "policy:", "sandbox:"])
+    local_authority_prefixes: List[str] = Field(default_factory=lambda: ["approval:", "policy:", "sandbox:", "receipt:"])
+    grounds_namespaces: Dict[str, str] = Field(
+        default_factory=lambda: {
+            "msg": "message identifiers",
+            "tool": "tool or execution receipts",
+            "src": "external source citations",
+            "doc": "document anchors",
+            "receipt": "authority or execution receipts",
+            "policy": "local policy artifacts",
+        }
+    )
     warrant_strength_order: Dict[WarrantType, int] = Field(
         default_factory=lambda: {
             "OBSERVED": 5,
@@ -150,9 +201,25 @@ class DeploymentProfile(BaseModel):
     )
     relay_parent_prefixes: List[str] = Field(default_factory=lambda: ["h:upstream-relay", "relay:hop:"])
     independence_policy_name: str = "declared-lineage-default"
+    ordering_anchor_semantics: str = "timestamp-sequence-total-order"
 
     def strength_of(self, warrant_type: WarrantType) -> int:
         return self.warrant_strength_order.get(warrant_type, 0)
+
+    def namespace_allowed(self, ref: str) -> bool:
+        if ":" not in ref:
+            return False
+        namespace = ref.split(":", 1)[0]
+        return namespace in self.grounds_namespaces
+
+
+DEFAULT_PROFILE_PATH = Path(__file__).with_name("attest-profile-default-v02.json")
+
+
+def load_profile(path: Optional[str] = None) -> DeploymentProfile:
+    target = Path(path) if path else DEFAULT_PROFILE_PATH
+    data = json.loads(target.read_text(encoding="utf-8"))
+    return DeploymentProfile.model_validate(data)
 
 
 class AttestVerifier:
@@ -162,7 +229,7 @@ class AttestVerifier:
         grounds_resolver: Optional[GroundsResolver] = None,
         signature_verifier: Optional[SignatureVerifier] = None,
     ):
-        self.profile = profile or DeploymentProfile()
+        self.profile = profile or load_profile()
         self.grounds_resolver = grounds_resolver or FailClosedResolver()
         self.signature_verifier = signature_verifier or StubSignatureVerifier()
 
@@ -170,10 +237,13 @@ class AttestVerifier:
         strengths = [self.profile.strength_of(m.warrant.type) for m in chain if m.warrant]
         return max(strengths, default=0)
 
-    def _grounds_resolve_to_artifact(self, grounds: List[str]) -> bool:
+    def _resolve_grounds(self, grounds: List[str]) -> List[GroundsResolution]:
         if not grounds:
-            return False
-        return all(self.grounds_resolver.resolve(ref) for ref in grounds)
+            return []
+        return [self.grounds_resolver.resolve(ref) for ref in grounds]
+
+    def _grounds_all_resolved(self, resolutions: List[GroundsResolution]) -> bool:
+        return bool(resolutions) and all(resolution.status == "resolved" for resolution in resolutions)
 
     def _signature_required(self, msg: AttestMessage) -> bool:
         if msg.frame in self.profile.signature_required_frames:
@@ -188,10 +258,17 @@ class AttestVerifier:
     def _grounds_reference_external_authority(self, grounds: List[str]) -> bool:
         return any(any(g.startswith(prefix) for prefix in self.profile.external_authority_prefixes) for g in grounds)
 
-    def _has_local_authority_receipt(self, msg: AttestMessage) -> bool:
+    def _authority_receipt_binds_message(self, receipt: AuthorityReceipt, msg: AttestMessage, computed_id: str) -> bool:
+        message_match = receipt.bound_message_id in (None, computed_id)
+        parent_match = not receipt.bound_parent_ids or receipt.bound_parent_ids == msg.parents
+        return message_match and parent_match
+
+    def _has_local_authority_receipt(self, msg: AttestMessage, computed_id: str) -> bool:
         for receipt in msg.authority_receipts:
-            if receipt.kind in self.profile.accepted_authority_kinds and any(
-                receipt.receipt_ref.startswith(prefix) for prefix in self.profile.local_authority_prefixes
+            if (
+                receipt.kind in self.profile.accepted_authority_kinds
+                and any(receipt.receipt_ref.startswith(prefix) for prefix in self.profile.local_authority_prefixes)
+                and self._authority_receipt_binds_message(receipt, msg, computed_id)
             ):
                 return True
         return False
@@ -204,6 +281,13 @@ class AttestVerifier:
         if msg.frame == "COMMIT":
             return True
         return False
+
+    def _validate_ground_namespaces(self, grounds: List[str]) -> List[str]:
+        issues: List[str] = []
+        for ground in grounds:
+            if not self.profile.namespace_allowed(ground):
+                issues.append(f"GROUND_NAMESPACE_UNSUPPORTED:{ground}")
+        return issues
 
     def verify(
         self,
@@ -222,15 +306,21 @@ class AttestVerifier:
         if self._warrant_required(msg) and msg.warrant is None:
             result["hard_fail"].append("WARRANT_REQUIRED")
 
+        grounds = msg.warrant.grounds if msg.warrant else []
+        result["hard_fail"].extend(self._validate_ground_namespaces(grounds))
+        ground_resolutions = self._resolve_grounds(grounds)
+
         if msg.warrant and msg.warrant.type in ("OBSERVED", "RETRIEVED", "REPORTED") and not msg.warrant.grounds:
             result["hard_fail"].append("EVIDENTIAL_WARRANT_MISSING_GROUNDS")
 
         if msg.warrant and msg.warrant.type in ("OBSERVED", "DERIVED", "RETRIEVED", "REPORTED"):
-            if msg.warrant.grounds and not self._grounds_resolve_to_artifact(msg.warrant.grounds):
+            if msg.warrant.grounds and not self._grounds_all_resolved(ground_resolutions):
+                unresolved = [resolution.ref for resolution in ground_resolutions if resolution.status != "resolved"]
                 if msg.warrant.type == "OBSERVED":
                     result["hard_fail"].append("OBSERVED_GROUNDS_NOT_ARTIFACT_BACKED")
                 else:
                     result["hard_fail"].append("GROUNDS_UNRESOLVED")
+                result["soft_flag"].append(f"GROUND_RESOLUTION_FAILURES:{','.join(unresolved)}")
                 if msg.warrant.confidence:
                     result["soft_flag"].append("CONFIDENCE_DOWNGRADED_TO_ASSUMED")
 
@@ -240,12 +330,15 @@ class AttestVerifier:
             if declared > chain_max:
                 prior_grounds = [gg for m in adopted_chain for gg in (m.warrant.grounds if m.warrant else [])]
                 new_grounds = [g for g in msg.warrant.grounds if g not in prior_grounds]
-                if not new_grounds or not self._grounds_resolve_to_artifact(new_grounds):
+                new_ground_resolutions = self._resolve_grounds(new_grounds)
+                if not new_grounds or not self._grounds_all_resolved(new_ground_resolutions):
                     result["hard_fail"].append("ENDORSE_CEILING_VIOLATION")
                 else:
                     result["soft_flag"].append(f"ENDORSE_INDEPENDENCE_SHOULD_BE_CHECKED:{self.profile.independence_policy_name}")
 
-        signature_enforced = bool(self.profile.signature_required_frames or self.profile.signature_recommended_frames or self.profile.signature_required_retract_when_warranted)
+        signature_enforced = bool(
+            self.profile.signature_required_frames or self.profile.signature_recommended_frames or self.profile.signature_required_retract_when_warranted
+        )
         if self._signature_required(msg):
             if not msg.sig:
                 result["hard_fail"].append("SIGNATURE_REQUIRED_BY_PROFILE")
@@ -260,7 +353,10 @@ class AttestVerifier:
             result["soft_flag"].append("RELAY_UPTAKE_MISSING")
 
         has_external_grounds = bool(msg.warrant and self._grounds_reference_external_authority(msg.warrant.grounds))
-        has_local_authority = self._has_local_authority_receipt(msg)
+        has_local_authority = self._has_local_authority_receipt(msg, computed_id)
+
+        if msg.authority_receipts and not has_local_authority and msg.frame in self.profile.authority_required_frames:
+            result["hard_fail"].append("AUTHORITY_RECEIPT_BINDING_INVALID")
 
         if (
             self.profile.require_local_authority_chain_for_state_change
@@ -291,6 +387,7 @@ class AttestVerifier:
 
         if msg.frame == "ASSERT" and msg.content == "aggregate: dissent referenced but minimized":
             result["soft_flag"].append("DISSENT_MEANING_LAUNDERED")
+            result["pass_scope_limit"].append("DISSENT_PRESENCE_PRESERVED_ONLY")
 
         if msg.mode == "opaque":
             result["pass_scope_limit"].append("OPAQUE_PAYLOAD_TRUTH_BINDING_LIMIT")
