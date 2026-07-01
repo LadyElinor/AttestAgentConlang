@@ -245,29 +245,6 @@ def materialize_special_references(name: str, data: dict) -> dict:
     if name == "Case 6. Unsigned reliance-bearing ASSERT":
         data["sig"] = None
 
-    if name == "Case 4. ENDORSE with new-but-correlated grounds":
-        data["deontic"] = {
-            "type": "POLICY",
-            "authority": ["policy:review-only-endorse"],
-            "scope": "general",
-            "binds": {"message": "PENDING", "parents": data["parents"]},
-            "nonce": "nonce-policy-001",
-        }
-        temp = make_message(data)
-        data["deontic"]["binds"]["message"] = temp.compute_core_id()
-
-    if name == "Case 13. External telemetry with explicit local approval receipt":
-        data["action_scope"] = "state_change"
-        data["deontic"] = {
-            "type": "HUMAN_APPROVAL",
-            "authority": ["approval:ops-001"],
-            "scope": "state_change",
-            "binds": {"message": "PENDING", "parents": data["parents"]},
-            "nonce": "nonce-ops-001",
-        }
-        temp = make_message(data)
-        data["deontic"]["binds"]["message"] = temp.compute_core_id()
-
     return data
 
 

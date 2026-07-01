@@ -288,7 +288,9 @@ Namespaces admissible as epistemic grounds but declared external, external `src:
 
 ### 8A.4 Binding to the concrete reliance context
 
-A deontic warrant must bind to the act it authorizes. `binds.message` must equal the message's own computed ID, or be establishable as covering it, for example an approval issued against the adopted-chain root the message derives from, and `binds.parents` must match the message's `parents`. An absent binding, or a binding that does not match, is malformed on a state-changing frame. Unbound authority is never universally valid.
+A deontic warrant must bind to the act it authorizes. `binds.message` must equal the message's computed core ID (§10.2.1), or be establishable as covering it, for example an approval issued against the adopted-chain root the message derives from, and `binds.parents` must match the message's `parents`. An absent binding, or a binding that does not match, is malformed on a state-changing frame. Unbound authority is never universally valid.
+
+The binding target is the core ID rather than the full message ID by necessity, not convenience. The deontic object is itself identity-bearing (§10.2, §8A.7.7), so a warrant cannot contain the hash of a message whose hash covers that warrant; a full-ID binding rule is unimplementable. Binding to the deontic-excluded core form breaks the circularity while still fixing every act-relevant field, including `action_scope`, so bound authority cannot be transplanted onto a message that changes the act it authorizes.
 
 ### 8A.5 Delegation chains and the delegation ceiling
 
@@ -299,7 +301,7 @@ A deontic warrant must bind to the act it authorizes. `binds.message` must equal
 
 ### 8A.6 Scope coverage
 
-State-changing frames must declare `action_scope`, default ontology, profile-declared and extensible: `state_change`, `package_install`, `shell_exec`, `network_fetch`, `general`. The deontic warrant's `scope` must cover the message's `action_scope`.
+State-changing frames must declare `action_scope`, default ontology, profile-declared and extensible: `state_change`, `package_install`, `shell_exec`, `network_fetch`, `general`. The deontic warrant's `scope` must cover the message's `action_scope`. Coverage semantics: `general` is the top element of the default ontology and covers any declared `action_scope`; every other scope covers only itself. Profiles that extend the ontology must publish its partial order; absent a published order, only exact match and `general`-coverage are defined, and any other cross-scope coverage claim is non-conformant.
 
 - Hard: typed scope non-coverage, for example authority scoped `network_fetch` while the act declares `state_change`, is a well-formedness failure.
 - Soft: whether a covering scope is substantively appropriate to the act described in `content` is a semantic judgment (§15.8).
@@ -385,6 +387,17 @@ A message ID is the hash of the canonicalized form of exactly these fields:
 - ordering anchor
 
 No implementation may add or omit identity-bearing fields from this set while claiming compatibility. Consistent with §10.1, fields marked "when present" are omitted from the canonical form when absent, so a message carrying no deontic warrant hashes identically to the pre-§8A form.
+
+### 10.2.1 Core ID
+
+The core ID is the hash of the canonicalized form of exactly the §10.2 identity field set with the deontic warrant removed. Every other identity-bearing field, including `action_scope`, remains in the core form. Canonicalization rules are identical to §10.1.
+
+The core ID exists to resolve a structural circularity. `binds.message` (§8A.4) must name the message it authorizes, but the deontic warrant that carries `binds` is inside the message identity, so no warrant can contain the full message ID. A warrant therefore binds to the core ID, and the full message ID in turn covers the warrant. The two identities have distinct, non-interchangeable roles:
+
+- The **message ID** is the integrity and reference identity. Parents, targets, grounds references, retraction targets, and signatures name or cover it, and it changes whenever authority is added, removed, or retargeted (§8A.7.7).
+- The **core ID** is the authorization binding target. It is stable across attachment or replacement of the deontic object, so an authorizer can issue an approval against the act before the warrant citing that approval exists.
+
+An implementation must never accept a `binds.message` match against the full message ID as satisfying §8A.4, and must never treat a core ID as a message reference in parents, targets, or grounds. Because absent optional fields are omitted from the canonical form (§10.1), a message carrying no deontic warrant has a core ID equal to its message ID; this coincidence carries no semantic weight.
 
 ### 10.3 Signatures and origin binding
 

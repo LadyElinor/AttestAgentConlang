@@ -25,6 +25,7 @@ The main priorities are:
 - `attest-serialized-examples.md` - serialized example cases used by the harness
 - `tests/test_properties.py` - property and regression tests
 - `attest.txt` - concise high-level project description aligned to current scope
+- `attest-gap-ledger.md` - authoritative record of known spec/implementation divergences
 
 ## Status
 
@@ -35,7 +36,7 @@ The reference implementation is explicit about what is implemented versus delega
 - grounds resolution is supplied by a resolver interface
 - signature verification is supplied by a verifier interface
 - deployment policy is profile-driven and now has a draft artifact form
-- crypto conformance examples exist in deterministic test-vector form, not yet real Ed25519 interop vectors
+- signature verification uses real Ed25519 (PyNaCl) with a per-run generated key in the harness; fixed cross-implementation interop vectors do not yet exist
 
 ## Quick start
 

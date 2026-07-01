@@ -100,14 +100,16 @@
   },
   "content": "I endorse after additional retrieval.",
   "sig": "ed25519:...",
-  "authority_receipts": [
-    {
-      "kind": "local_policy",
-      "receipt_ref": "policy:review-only-endorse",
-      "scope": "general",
-      "issuer": "policy:attest-default-v02"
-    }
-  ]
+  "deontic": {
+    "type": "POLICY",
+    "authority": ["policy:review-only-endorse"],
+    "scope": "general",
+    "binds": {
+      "message": "40126d8aaef783f9da52bf3fe83ffd75ab78222fcd054a40aba2115065aabc1f",
+      "parents": ["h:weak-reported-msg..."]
+    },
+    "nonce": "nonce-policy-001"
+  }
 }
 ```
 
@@ -278,19 +280,22 @@
   "to": "agent:local-shell",
   "parents": ["h:external-telemetry-msg..."],
   "ordering_anchor": ["2026-06-29T20:46:00Z", 127],
+  "action_scope": "state_change",
   "warrant": {
     "type": "REPORTED",
     "confidence": [0.64, 0.78],
     "grounds": ["src:sentry-event:resolution-text"]
   },
-  "authority_receipts": [
-    {
-      "kind": "human_approval",
-      "receipt_ref": "approval:operator-confirmed-001",
-      "scope": "state_change",
-      "issuer": "user:operator"
-    }
-  ],
+  "deontic": {
+    "type": "HUMAN_APPROVAL",
+    "authority": ["approval:ops-001"],
+    "scope": "state_change",
+    "binds": {
+      "message": "005fec43d2b1c926ded740e152fe16593780dd71798969ccab17ae7a723313fd",
+      "parents": ["h:external-telemetry-msg..."]
+    },
+    "nonce": "nonce-ops-001"
+  },
   "content": "Run npm install reviewed-fix-package after explicit operator approval."
 }
 ```

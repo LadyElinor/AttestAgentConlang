@@ -49,16 +49,17 @@ Current resolution outcomes:
 - malformed
 - inaccessible-under-profile
 
-### 1.4 Authority receipt binding
-Authority receipts now bind not just to generic approval class, but to the concrete state-changing reliance context.
+### 1.4 Deontic warrant binding (formerly "authority receipts")
+The `authority_receipts` array is retired. Authorization is carried by the `deontic` object (spec §8A), which binds not just to a generic approval class but to the concrete state-changing reliance context.
 
-Current binding fields:
-- `bound_message_id` (bound to the authority-excluded core digest to avoid self-reference loops)
-- `bound_parent_ids`
-- `scope`
-- `issuer`
-- optional `expires_at`
-- required nonce in current reference behavior for authority-required frames
+Current binding fields, under migrated names:
+- `binds.message` (bound to the deontic-excluded core ID, spec §10.2.1, to avoid self-reference loops)
+- `binds.parents`
+- `scope` (must cover the message's `action_scope`, spec §8A.6)
+- `expires`, optional
+- `nonce`, required under current reference behavior for authority-required frames
+
+Issuer identity now lives in the resolved authority artifact rather than the envelope. Envelopes carrying the retired `authority_receipts` field are rejected at parse time; retired fields are never silently ignored.
 
 ### 1.5 Dissent-layer split
 Attest v0.2 distinguishes:

@@ -9,7 +9,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional, Protocol, Set, Tuple
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 try:
     from nacl.exceptions import BadSignatureError
@@ -204,6 +204,8 @@ class Ed25519SignatureVerifier:
 
 
 class Warrant(BaseModel):
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+
     type: WarrantType
     confidence: Optional[Tuple[float, float]] = None
     grounds: List[str] = Field(default_factory=list)
@@ -218,11 +220,15 @@ class GroundsResolutionPolicy(BaseModel):
 
 
 class DeonticBinding(BaseModel):
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+
     message: Optional[str] = None
     parents: List[str] = Field(default_factory=list)
 
 
 class DeonticWarrant(BaseModel):
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+
     type: AuthorityType
     authority: List[str] = Field(default_factory=list)
     scope: Optional[ActionScope] = None
@@ -232,6 +238,8 @@ class DeonticWarrant(BaseModel):
 
 
 class AttestMessage(BaseModel):
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+
     id: Optional[str] = None
     frame: FrameType
     mode: PayloadMode

@@ -1,6 +1,9 @@
 import base64
 import unicodedata
 
+import pytest
+from pydantic import ValidationError
+
 from hypothesis import given, strategies as st
 
 from attest_ref_impl import (
@@ -247,3 +250,53 @@ def test_transitive_grounds_cycle_currently_not_enforced_across_mixed_refs():
     )
     result = v.verify(a2, known_messages=[a2, b])
     assert result == {"hard_fail": [], "soft_flag": [], "pass_scope_limit": []}
+
+
+# --- Retired / unknown envelope fields must be rejected, never silently ignored ---
+
+def _base_envelope():
+    return {"frame": "COMMIT", "mode": "legible", "from": "a", "to": "b",
+            "parents": ["msg:root"], "ordering_anchor": ANCHOR,
+            "action_scope": "state_change", "content": "do the thing"}
+
+
+def test_retired_authority_receipts_field_rejected_at_parse():
+    payload = _base_envelope()
+    payload["authority_receipts"] = [{
+        "kind": "human_approval", "receipt_ref": "approval:ops-1",
+        "scope": "state_change", "issuer": "user:operator",
+    }]
+    with pytest.raises(ValidationError):
+        AttestMessage.model_validate(payload)
+
+
+def test_unknown_envelope_field_rejected_at_parse():
+    payload = _base_envelope()
+    payload["smuggled_unhashed_field"] = "not covered by any identity"
+    with pytest.raises(ValidationError):
+        AttestMessage.model_validate(payload)
+
+
+def test_retired_binding_field_names_rejected_inside_deontic():
+    base = _base_envelope()
+    core = AttestMessage.model_validate(base).compute_core_id()
+    base["deontic"] = {
+        "type": "HUMAN_APPROVAL", "authority": ["approval:ops-1"],
+        "scope": "state_change",
+        "binds": {"message": core, "parents": ["msg:root"]},
+        "bound_message_id": core,  # retired v0.2-delta era name
+    }
+    with pytest.raises(ValidationError):
+        AttestMessage.model_validate(base)
+
+
+def test_unknown_field_inside_binds_rejected():
+    base = _base_envelope()
+    core = AttestMessage.model_validate(base).compute_core_id()
+    base["deontic"] = {
+        "type": "HUMAN_APPROVAL", "authority": ["approval:ops-1"],
+        "scope": "state_change",
+        "binds": {"message": core, "parents": ["msg:root"], "issuer": "user:operator"},
+    }
+    with pytest.raises(ValidationError):
+        AttestMessage.model_validate(base)
