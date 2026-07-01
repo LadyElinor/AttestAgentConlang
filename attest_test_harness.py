@@ -10,10 +10,8 @@ from attest_ref_impl import (
     AcceptAllSignatureVerifier,
     AttestMessage,
     AttestVerifier,
-    AuthorityResolution,
     DeploymentProfile,
     Ed25519SignatureVerifier,
-    GroundsResolution,
     StaticAuthorityResolver,
     StaticGroundsResolver,
     load_profile,
@@ -35,6 +33,7 @@ EXAMPLE_EXPECTATIONS: List[Tuple[str, str]] = [
     ("Case 12. External remediation text upgraded into ENDORSE authority", "hard_fail"),
     ("Case 13. External telemetry with explicit local approval receipt", "soft_flag"),
     ("Case 14. Misbound authority receipt on COMMIT", "hard_fail"),
+    ("Case 15. Circular grounds chain returns to originating claim", "hard_fail"),
 ]
 
 SIGNING_KEY = SigningKey.generate()
@@ -47,6 +46,7 @@ def harness_profile(signature_required_frames=None) -> DeploymentProfile:
     profile.signature_required_frames = signature_required_frames or set()
     profile.signature_required_retract_when_warranted = False
     profile.signature_recommended_frames = set()
+    profile.authority_required_frames = {"COMMIT", "DELEGATE", "ENDORSE"}
     return profile
 
 
@@ -131,6 +131,23 @@ def infer_adopted_chain(name: str) -> List[AttestMessage]:
         )
         return [intermediate]
 
+    if name == "Case 15. Circular grounds chain returns to originating claim":
+        b = make_message(
+            {
+                "id": "msg:cycle-b",
+                "frame": "ASSERT",
+                "mode": "legible",
+                "from": "agent:cycle-b",
+                "to": "agent:cycle-a",
+                "parents": [],
+                "ordering_anchor": ["2026-06-30T22:10:00Z", 300],
+                "warrant": {"type": "DERIVED", "grounds": ["msg:cycle-a"]},
+                "content": "B depends on A.",
+            },
+            keep_id=False,
+        )
+        return [b]
+
     return []
 
 
@@ -152,6 +169,9 @@ def infer_known_messages(name: str) -> List[AttestMessage]:
         intermediate = infer_adopted_chain(name)[0]
         return [retract, intermediate]
 
+    if name == "Case 15. Circular grounds chain returns to originating claim":
+        return []
+
     return []
 
 
@@ -169,6 +189,7 @@ def collect_resolver_known_refs(examples: Dict[str, dict], known_messages: List[
 
     for message in known_messages:
         refs.add(message.compute_id())
+        refs.add(message.compute_core_id())
         refs.update(message.targets)
         if message.warrant:
             refs.update(message.warrant.grounds)
@@ -209,6 +230,8 @@ def collect_known_authorities(case_name: str) -> Set[str]:
         refs.add("policy:review-only-endorse")
     if case_name == "Case 13. External telemetry with explicit local approval receipt":
         refs.add("approval:ops-001")
+    if case_name == "Case 14. Misbound authority receipt on COMMIT":
+        refs.add("approval:ops-001")
     return refs
 
 
@@ -223,36 +246,27 @@ def materialize_special_references(name: str, data: dict) -> dict:
         data["sig"] = None
 
     if name == "Case 4. ENDORSE with new-but-correlated grounds":
-        data["authority_receipts"] = [
-            {
-                "kind": "local_policy",
-                "receipt_ref": "policy:review-only-endorse",
-                "scope": "general",
-                "issuer": "policy:attest-default-v02",
-                "bound_message_id": "PENDING",
-                "bound_parent_ids": data["parents"],
-                "expires_at": "2099-01-01T00:00:00Z",
-                "nonce": "nonce-policy-001",
-            }
-        ]
+        data["deontic"] = {
+            "type": "POLICY",
+            "authority": ["policy:review-only-endorse"],
+            "scope": "general",
+            "binds": {"message": "PENDING", "parents": data["parents"]},
+            "nonce": "nonce-policy-001",
+        }
         temp = make_message(data)
-        data["authority_receipts"][0]["bound_message_id"] = temp.compute_core_id()
+        data["deontic"]["binds"]["message"] = temp.compute_core_id()
 
     if name == "Case 13. External telemetry with explicit local approval receipt":
-        data["authority_receipts"] = [
-            {
-                "kind": "human_approval",
-                "receipt_ref": "approval:ops-001",
-                "scope": "state_change",
-                "issuer": "human:operator",
-                "bound_message_id": "PENDING",
-                "bound_parent_ids": data["parents"],
-                "expires_at": "2099-01-01T00:00:00Z",
-                "nonce": "nonce-ops-001",
-            }
-        ]
+        data["action_scope"] = "state_change"
+        data["deontic"] = {
+            "type": "HUMAN_APPROVAL",
+            "authority": ["approval:ops-001"],
+            "scope": "state_change",
+            "binds": {"message": "PENDING", "parents": data["parents"]},
+            "nonce": "nonce-ops-001",
+        }
         temp = make_message(data)
-        data["authority_receipts"][0]["bound_message_id"] = temp.compute_core_id()
+        data["deontic"]["binds"]["message"] = temp.compute_core_id()
 
     return data
 
@@ -305,20 +319,40 @@ def run_tests() -> int:
         "to": "agent:executor-0",
         "parents": ["relay:hop:1"],
         "ordering_anchor": ["2026-06-30T14:59:00Z", 200],
+        "action_scope": "state_change",
         "warrant": {"type": "REPORTED", "grounds": ["src:sentry-event:resolution-text"]},
-        "authority_receipts": [
-            {
-                "kind": "human_approval",
-                "receipt_ref": "approval:ops-001",
-                "scope": "state_change",
-                "issuer": "human:operator",
-                "bound_message_id": "deadbeef",
-                "bound_parent_ids": ["relay:hop:other"],
-                "expires_at": "2099-01-01T00:00:00Z",
-                "nonce": "nonce-invalid"
-            }
-        ],
+        "deontic": {
+            "type": "HUMAN_APPROVAL",
+            "authority": ["approval:ops-001"],
+            "scope": "state_change",
+            "binds": {"message": "deadbeef", "parents": ["relay:hop:1"]},
+            "nonce": "nonce-invalid"
+        },
         "content": "Apply remediation from external issue.",
+        "sig": None
+    }
+    cycle_seed = make_message(
+        {
+            "frame": "ASSERT",
+            "mode": "legible",
+            "from": "agent:cycle-a",
+            "to": "agent:cycle-b",
+            "parents": [],
+            "ordering_anchor": ["2026-06-30T22:11:00Z", 301],
+            "warrant": {"type": "DERIVED", "grounds": []},
+            "content": "Self-grounded cycle seed.",
+            "sig": None,
+        }
+    )
+    synthetic_examples["Case 15. Circular grounds chain returns to originating claim"] = {
+        "frame": "ASSERT",
+        "mode": "legible",
+        "from": "agent:cycle-a",
+        "to": "agent:cycle-b",
+        "parents": [],
+        "ordering_anchor": ["2026-06-30T22:11:00Z", 301],
+        "warrant": {"type": "DERIVED", "grounds": [cycle_seed.compute_id()]},
+        "content": "Self-grounded cycle seed.",
         "sig": None
     }
 

@@ -24,6 +24,8 @@ PayloadMode = Literal["legible", "opaque"]
 GroundsStatus = Literal["resolved", "unresolved", "stale", "malformed", "inaccessible_under_profile"]
 AuthorityStatus = Literal["resolved", "unresolved", "expired", "malformed", "inaccessible_under_profile"]
 ResolutionPolicy = Literal["hard_fail", "soft_flag", "profile_unsupported"]
+AuthorityType = Literal["HUMAN_APPROVAL", "POLICY", "CAPABILITY", "DELEGATED", "SANDBOX", "NONE"]
+ActionScope = Literal["state_change", "package_install", "shell_exec", "network_fetch", "general"]
 
 
 CANONICAL_FIELD_ORDER = [
@@ -35,12 +37,17 @@ CANONICAL_FIELD_ORDER = [
     "parents",
     "targets",
     "ordering_anchor",
+    "action_scope",
     "warrant",
-    "authority_receipts",
+    "deontic",
     "content",
 ]
 
-CORE_CANONICAL_FIELD_ORDER = [field for field in CANONICAL_FIELD_ORDER if field != "authority_receipts"]
+# The core id is the binding target for deontic authority. It must be stable
+# regardless of which authority object is attached, so it excludes `deontic`.
+# `action_scope` IS included, so an approval binds to the action it authorized
+# and cannot be transplanted onto a message that changes the action.
+CORE_CANONICAL_FIELD_ORDER = [field for field in CANONICAL_FIELD_ORDER if field != "deontic"]
 
 
 def _normalize_json_value(value: Any) -> Any:
@@ -69,6 +76,14 @@ def _parse_iso8601(value: str) -> Optional[datetime]:
     return parsed.astimezone(timezone.utc)
 
 
+def _looks_like_message_ref(ref: str) -> bool:
+    return ref.startswith("msg:") or ref.startswith("h:")
+
+
+def _dedupe(items: List[str]) -> List[str]:
+    return list(dict.fromkeys(items))
+
+
 class GroundsResolution(BaseModel):
     ref: str
     status: GroundsStatus
@@ -79,6 +94,9 @@ class AuthorityResolution(BaseModel):
     ref: str
     status: AuthorityStatus
     detail: Optional[str] = None
+    granted_type: Optional[AuthorityType] = None
+    granted_scope: Optional[ActionScope] = None
+    delegates_from: List[str] = Field(default_factory=list)
 
 
 class GroundsResolver(Protocol):
@@ -115,13 +133,23 @@ class StaticGroundsResolver:
 
 
 class StaticAuthorityResolver:
-    def __init__(self, known_refs: Optional[Set[str]] = None, status_overrides: Optional[Dict[str, AuthorityStatus]] = None):
+    def __init__(self, known_refs: Optional[Set[str]] = None, status_overrides: Optional[Dict[str, AuthorityStatus]] = None, grants: Optional[Dict[str, dict]] = None):
         self.known_refs = known_refs or set()
         self.status_overrides = status_overrides or {}
+        self.grants = grants or {}
 
     def resolve(self, ref: str) -> AuthorityResolution:
         if ref in self.status_overrides:
             return AuthorityResolution(ref=ref, status=self.status_overrides[ref])
+        if ref in self.grants:
+            g = self.grants[ref]
+            return AuthorityResolution(
+                ref=ref,
+                status="resolved",
+                granted_type=g.get("granted_type"),
+                granted_scope=g.get("granted_scope"),
+                delegates_from=g.get("delegates_from", []),
+            )
         if ref in self.known_refs:
             return AuthorityResolution(ref=ref, status="resolved")
         return AuthorityResolution(ref=ref, status="unresolved")
@@ -189,14 +217,17 @@ class GroundsResolutionPolicy(BaseModel):
     confidence_without_method_artifact: ResolutionPolicy = "soft_flag"
 
 
-class AuthorityReceipt(BaseModel):
-    kind: Literal["human_approval", "local_policy", "sandbox_policy"]
-    receipt_ref: str
-    scope: Literal["state_change", "package_install", "shell_exec", "network_fetch", "general"] = "general"
-    issuer: str
-    bound_message_id: Optional[str] = None
-    bound_parent_ids: List[str] = Field(default_factory=list)
-    expires_at: Optional[str] = None
+class DeonticBinding(BaseModel):
+    message: Optional[str] = None
+    parents: List[str] = Field(default_factory=list)
+
+
+class DeonticWarrant(BaseModel):
+    type: AuthorityType
+    authority: List[str] = Field(default_factory=list)
+    scope: Optional[ActionScope] = None
+    binds: Optional[DeonticBinding] = None
+    expires: Optional[str] = None
     nonce: Optional[str] = None
 
 
@@ -211,12 +242,13 @@ class AttestMessage(BaseModel):
     targets: List[str] = Field(default_factory=list)
     ordering_anchor: Tuple[str, int]
     warrant: Optional[Warrant] = None
-    authority_receipts: List[AuthorityReceipt] = Field(default_factory=list)
+    action_scope: Optional[ActionScope] = None
+    deontic: Optional[DeonticWarrant] = None
     content: Any
     sig: Optional[str] = None
 
     def canonical_dict(self) -> Dict[str, Any]:
-        canonical = {
+        full = {
             "frame": self.frame,
             "mode": self.mode,
             "from": self.from_,
@@ -225,15 +257,16 @@ class AttestMessage(BaseModel):
             "parents": self.parents,
             "targets": self.targets,
             "ordering_anchor": list(self.ordering_anchor),
+            "action_scope": self.action_scope,
             "warrant": self.warrant.model_dump() if self.warrant else None,
-            "authority_receipts": [receipt.model_dump() for receipt in self.authority_receipts],
+            "deontic": self.deontic.model_dump() if self.deontic else None,
             "content": self.content,
         }
-        return {field: canonical[field] for field in CANONICAL_FIELD_ORDER}
+        return {field: full[field] for field in CANONICAL_FIELD_ORDER if full[field] is not None}
 
     def canonical_core_dict(self) -> Dict[str, Any]:
         canonical = self.canonical_dict()
-        return {field: canonical[field] for field in CORE_CANONICAL_FIELD_ORDER}
+        return {field: canonical[field] for field in CORE_CANONICAL_FIELD_ORDER if field in canonical}
 
     def canonical_bytes(self) -> bytes:
         return canonicalize_json_bytes(self.canonical_dict())
@@ -264,11 +297,11 @@ class DeploymentProfile(BaseModel):
     signature_required_retract_when_warranted: bool = True
     signature_recommended_frames: Set[FrameType] = Field(default_factory=lambda: {"COMMIT"})
     state_changing_frames: Set[FrameType] = Field(default_factory=lambda: {"COMMIT"})
-    authority_required_frames: Set[FrameType] = Field(default_factory=lambda: {"COMMIT", "ENDORSE"})
-    accepted_authority_kinds: Set[str] = Field(default_factory=lambda: {"human_approval", "local_policy", "sandbox_policy"})
-    require_local_authority_chain_for_state_change: bool = True
+    authority_required_frames: Set[FrameType] = Field(default_factory=lambda: {"COMMIT", "DELEGATE"})
+    accepted_authority_types: Set[AuthorityType] = Field(default_factory=lambda: {"HUMAN_APPROVAL", "POLICY", "CAPABILITY", "DELEGATED", "SANDBOX"})
+    authority_namespaces: Set[str] = Field(default_factory=lambda: {"approval", "policy", "grant", "capability", "sandbox", "receipt"})
+    nonce_required_for_authority: bool = False
     external_authority_prefixes: List[str] = Field(default_factory=lambda: ["src:sentry-event", "src:external-issue", "src:ticket", "src:web", "src:github-issue"])
-    local_authority_prefixes: List[str] = Field(default_factory=lambda: ["approval:", "policy:", "sandbox:", "receipt:"])
     grounds_namespaces: Dict[str, str] = Field(
         default_factory=lambda: {
             "msg": "message identifiers",
@@ -351,62 +384,94 @@ class AttestVerifier:
     def _grounds_reference_external_authority(self, grounds: List[str]) -> bool:
         return any(any(g.startswith(prefix) for prefix in self.profile.external_authority_prefixes) for g in grounds)
 
-    def _authority_receipt_binds_message(self, receipt: AuthorityReceipt, msg: AttestMessage, computed_core_id: str) -> bool:
-        if receipt.bound_message_id != computed_core_id:
+    @staticmethod
+    def _scope_covers(granted: Optional[str], needed: Optional[str]) -> bool:
+        if needed is None:
+            return True
+        if granted is None:
             return False
-        if receipt.bound_parent_ids != msg.parents:
+        return granted == needed or granted == "general"
+
+    def _deontic_binds(self, d: "DeonticWarrant", msg: AttestMessage, computed_core_id: str) -> bool:
+        if d.binds is None:
+            return False
+        if d.binds.message != computed_core_id:
+            return False
+        if list(d.binds.parents) != list(msg.parents):
             return False
         return True
 
-    def _authority_receipt_unexpired(self, receipt: AuthorityReceipt) -> bool:
-        if receipt.expires_at is None:
-            return True
-        expires = _parse_iso8601(receipt.expires_at)
+    @staticmethod
+    def _authority_unexpired(expires: Optional[str]) -> bool:
         if expires is None:
+            return True
+        parsed = _parse_iso8601(expires)
+        if parsed is None:
             return False
-        return expires >= datetime.now(timezone.utc)
+        return parsed >= datetime.now(timezone.utc)
 
-    def _evaluate_authority_receipts(self, msg: AttestMessage, computed_core_id: str) -> Tuple[bool, List[str]]:
+    def _walk_delegation(self, ref: str, needed_scope: Optional[str], seen: Set[str], errors: List[str]) -> bool:
+        if ref in seen:
+            errors.append("DELEGATION_CYCLE")
+            return False
+        seen = seen | {ref}
+        res = self.authority_resolver.resolve(ref)
+        if res.status != "resolved":
+            errors.append(f"AUTHORITY_UNRESOLVED:{ref}")
+            return False
+        if not self._scope_covers(res.granted_scope, needed_scope):
+            errors.append("DELEGATED_AUTHORITY_NEVER_HELD")
+            return False
+        if res.granted_type != "DELEGATED":
+            return True
+        if not res.delegates_from:
+            errors.append("DELEGATED_AUTHORITY_NEVER_HELD")
+            return False
+        return all(self._walk_delegation(src, needed_scope, seen, errors) for src in res.delegates_from)
+
+    def _evaluate_deontic(self, msg: AttestMessage, computed_core_id: str) -> Tuple[bool, List[str]]:
         errors: List[str] = []
         if msg.frame not in self.profile.authority_required_frames:
             return True, errors
-        if not msg.authority_receipts:
-            errors.append("AUTHORITY_RECEIPT_REQUIRED")
-            return False, errors
-
-        valid_receipt_found = False
-        for receipt in msg.authority_receipts:
-            resolution = self.authority_resolver.resolve(receipt.receipt_ref)
-            if resolution.status != "resolved":
-                errors.append(f"AUTHORITY_RECEIPT_UNRESOLVED:{receipt.receipt_ref}")
-                continue
-            if receipt.kind not in self.profile.accepted_authority_kinds:
-                errors.append(f"AUTHORITY_KIND_UNACCEPTED:{receipt.kind}")
-                continue
-            if not any(receipt.receipt_ref.startswith(prefix) for prefix in self.profile.local_authority_prefixes):
-                errors.append(f"AUTHORITY_RECEIPT_PREFIX_INVALID:{receipt.receipt_ref}")
-                continue
-            if not self._authority_receipt_binds_message(receipt, msg, computed_core_id):
-                errors.append("AUTHORITY_RECEIPT_BINDING_INVALID")
-                continue
-            if not self._authority_receipt_unexpired(receipt):
-                errors.append("AUTHORITY_RECEIPT_EXPIRED")
-                continue
-            if not receipt.nonce:
-                errors.append("AUTHORITY_RECEIPT_NONCE_REQUIRED")
-                continue
-            valid_receipt_found = True
-
-        if not valid_receipt_found and not errors:
-            errors.append("AUTHORITY_RECEIPT_REQUIRED")
-        return valid_receipt_found, errors
+        if msg.frame in self.profile.state_changing_frames and msg.action_scope is None:
+            errors.append("ACTION_SCOPE_REQUIRED")
+        d = msg.deontic
+        if d is None:
+            errors.append("DEONTIC_WARRANT_REQUIRED")
+            return False, _dedupe(errors)
+        if d.type == "NONE":
+            errors.append("AUTHORITY_NONE_NOT_PERMITTED")
+            return False, _dedupe(errors)
+        if d.type not in self.profile.accepted_authority_types:
+            errors.append(f"AUTHORITY_TYPE_UNACCEPTED:{d.type}")
+        local_refs = [r for r in d.authority if ":" in r and r.split(":", 1)[0] in self.profile.authority_namespaces]
+        if not local_refs:
+            errors.append("EXTERNAL_ONLY_AUTHORITY")
+        if not self._deontic_binds(d, msg, computed_core_id):
+            errors.append("AUTHORITY_BINDING_INVALID")
+        if not self._authority_unexpired(d.expires):
+            errors.append("AUTHORITY_EXPIRED")
+        if d.nonce is None and self.profile.nonce_required_for_authority:
+            errors.append("AUTHORITY_NONCE_REQUIRED")
+        if not self._scope_covers(d.scope, msg.action_scope):
+            errors.append("AUTHORITY_SCOPE_NOT_COVERED")
+        if d.type == "DELEGATED":
+            needed = msg.action_scope or d.scope
+            if not d.authority:
+                errors.append("DELEGATED_AUTHORITY_NEVER_HELD")
+            for grant in d.authority:
+                self._walk_delegation(grant, needed, set(), errors)
+        else:
+            for r in d.authority:
+                if self.authority_resolver.resolve(r).status != "resolved":
+                    errors.append(f"AUTHORITY_UNRESOLVED:{r}")
+        errors = _dedupe(errors)
+        return (len(errors) == 0), errors
 
     def _warrant_required(self, msg: AttestMessage) -> bool:
         if msg.frame in ("ASSERT", "HYPOTHESIZE", "ENDORSE", "DISSENT"):
             return True
         if msg.frame == "RETRACT":
-            return True
-        if msg.frame == "COMMIT":
             return True
         return False
 
@@ -441,6 +506,7 @@ class AttestVerifier:
         message_map: Dict[str, AttestMessage] = {}
         for message in known_messages:
             message_map[message.compute_id()] = message
+            message_map[message.compute_core_id()] = message
             if message.id:
                 message_map[message.id] = message
             for target in message.targets:
@@ -476,6 +542,65 @@ class AttestVerifier:
                 queue.extend(parent_message.parents)
         return False
 
+    def _detect_grounds_cycle(self, msg: AttestMessage, known_messages: List[AttestMessage]) -> bool:
+        if not msg.warrant or not msg.warrant.grounds:
+            return False
+        known_map = self._build_known_message_map(known_messages)
+        target_refs = {msg.compute_id(), msg.compute_core_id()}
+        if msg.id:
+            target_refs.add(msg.id)
+            if msg.id.startswith("msg:"):
+                target_refs.add(msg.id[4:])
+        target_refs_with_msg = set(target_refs)
+        target_refs_with_msg.update({f"msg:{ref}" for ref in target_refs if not str(ref).startswith("msg:")})
+
+        alias_map: Dict[str, Set[str]] = {}
+        for known in known_messages:
+            aliases = {
+                known.compute_id(),
+                known.compute_core_id(),
+                f"msg:{known.compute_id()}",
+                f"msg:{known.compute_core_id()}",
+            }
+            if known.id:
+                aliases.add(known.id)
+                if isinstance(known.id, str) and known.id.startswith("msg:"):
+                    aliases.add(known.id[4:])
+                else:
+                    aliases.add(f"msg:{known.id}")
+            for alias in aliases:
+                alias_map[alias] = aliases
+
+        visited: Set[str] = set()
+        queue = deque(msg.warrant.grounds)
+        while queue:
+            ref = queue.popleft()
+            normalized_refs = {ref}
+            if isinstance(ref, str) and ref.startswith("msg:"):
+                normalized_refs.add(ref[4:])
+            else:
+                normalized_refs.add(f"msg:{ref}")
+            expanded_refs = set(normalized_refs)
+            for key in list(normalized_refs):
+                expanded_refs.update(alias_map.get(key, set()))
+            visit_key = next(iter(sorted(expanded_refs)))
+            if visit_key in visited:
+                continue
+            visited.add(visit_key)
+            if expanded_refs & target_refs_with_msg:
+                return True
+            if not any(_looks_like_message_ref(str(candidate_ref)) for candidate_ref in expanded_refs):
+                continue
+            candidate = None
+            for key in expanded_refs:
+                candidate = known_map.get(key)
+                if candidate:
+                    break
+            if candidate and candidate.warrant:
+                queue.extend(candidate.warrant.grounds)
+                queue.extend(candidate.parents)
+        return False
+
     def verify(
         self,
         msg: AttestMessage,
@@ -508,6 +633,9 @@ class AttestVerifier:
                 if msg.warrant.confidence and self.profile.grounds_resolution_policy.confidence_without_method_artifact == "soft_flag":
                     result["soft_flag"].append("CONFIDENCE_DOWNGRADED_TO_ASSUMED")
 
+        if self._detect_grounds_cycle(msg, known_messages + adopted_chain):
+            result["hard_fail"].append("GROUNDS_CYCLE_DETECTED")
+
         if msg.frame == "ENDORSE" and msg.warrant:
             declared = self.profile.strength_of(msg.warrant.type)
             chain_max = self.max_chain_strength(adopted_chain)
@@ -536,17 +664,10 @@ class AttestVerifier:
         if msg.frame == "COMMIT" and self._relay_parent_present(msg):
             result["soft_flag"].append("RELAY_UPTAKE_MISSING")
 
-        authority_valid, authority_errors = self._evaluate_authority_receipts(msg, computed_core_id)
+        authority_valid, authority_errors = self._evaluate_deontic(msg, computed_core_id)
         result["hard_fail"].extend(authority_errors)
 
         has_external_grounds = bool(msg.warrant and self._grounds_reference_external_authority(msg.warrant.grounds))
-
-        if (
-            self.profile.require_local_authority_chain_for_state_change
-            and msg.frame in self.profile.authority_required_frames
-            and not authority_valid
-        ):
-            result["hard_fail"].append("LOCAL_AUTHORITY_CHAIN_REQUIRED")
 
         if msg.frame == "COMMIT" and has_external_grounds:
             if authority_valid:
@@ -560,7 +681,7 @@ class AttestVerifier:
             else:
                 result["soft_flag"].append("EXTERNAL_REMEDIATION_LAUNDERED_INTO_AUTHORITY")
 
-        if self._transitively_relies_on_retracted_target(msg, known_messages):
+        if self._transitively_relies_on_retracted_target(msg, known_messages + adopted_chain):
             result["hard_fail"].append("RETRACTED_TARGET_STILL_RELIED_ON")
 
         relay_hops = [parent for parent in msg.parents if parent.startswith("relay:hop:")]
