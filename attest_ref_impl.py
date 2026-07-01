@@ -345,6 +345,17 @@ class DeploymentProfile(BaseModel):
         return namespace in self.grounds_namespaces
 
 
+# Pydantic can leave these models partially unresolved under isolated file-path
+# imports. Rebuild explicitly so `load_profile()` and runtime validation remain
+# usable when this module is loaded outside the normal package import path.
+Warrant.model_rebuild()
+GroundsResolutionPolicy.model_rebuild()
+DeonticBinding.model_rebuild()
+DeonticWarrant.model_rebuild()
+AttestMessage.model_rebuild()
+DeploymentProfile.model_rebuild()
+
+
 DEFAULT_PROFILE_PATH = Path(__file__).with_name("attest-profile-default-v02.json")
 
 
