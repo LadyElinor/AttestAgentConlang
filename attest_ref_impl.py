@@ -348,7 +348,15 @@ class DeploymentProfile(BaseModel):
 # Pydantic can leave these models partially unresolved under isolated file-path
 # imports. Rebuild explicitly so `load_profile()` and runtime validation remain
 # usable when this module is loaded outside the normal package import path.
+# NOTE: consumers loading this file via importlib must still register the
+# module in sys.modules before exec_module; these rebuilds are defense in
+# depth, not a substitute. The original rebuild list missed GroundsResolution
+# and AuthorityResolution, which made the first grounds resolution raise
+# PydanticUserError under isolated loading while everything else worked —
+# every model with deferred annotations must appear here, or none should.
 Warrant.model_rebuild()
+GroundsResolution.model_rebuild()
+AuthorityResolution.model_rebuild()
 GroundsResolutionPolicy.model_rebuild()
 DeonticBinding.model_rebuild()
 DeonticWarrant.model_rebuild()
